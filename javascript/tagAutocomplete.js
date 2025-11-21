@@ -1,4 +1,4 @@
-﻿const styleColors = {
+const styleColors = {
     "--results-neutral-text": ["#e0e0e0","black"],
     "--results-bg": ["#0b0f19", "#ffffff"],
     "--results-border-color": ["#4b5563", "#e5e7eb"],
@@ -31,8 +31,7 @@ const autocompleteCSS = `
         position: absolute;
         z-index: 999;
         max-width: calc(100% - 1.5rem);
-        flex-wrap: wrap;
-        gap: 10px;
+        flex-direction: column; /* Ensure children stack vertically */
     }
     .autocompleteResults {
         background-color: var(--results-bg) !important;
@@ -50,6 +49,7 @@ const autocompleteCSS = `
     .sideInfo {
         display: none;
         position: relative;
+        margin-left: 10px;
         height: 18rem;
         max-width: 16rem;
     }
@@ -151,6 +151,9 @@ const autocompleteCSS = `
         color: var(--live-translation-color-3);
     }
 `;
+
+// Track last textarea values to detect when specific characters were deleted
+const lastInputValues = new WeakMap();
 
 async function loadTags(c) {
     // Load main tags and aliases
@@ -523,19 +526,36 @@ async function insertTextAtCursor(textArea, result, tagword, tabCompletedWithout
 
     var prompt = textArea.value;
 
-    // Edit prompt text
-    let editStart = Math.max(cursorPos - tagword.length, 0);
-    let editEnd = Math.min(cursorPos + tagword.length, prompt.length);
+    // Determine the actually typed token at the caret to replace (supports space or underscore)
+    const leftOfCaret = prompt.slice(0, cursorPos);
+    const typedMatch = leftOfCaret.match(/([^,;\"|{}()\n]+)$/);
+    // Prefer the token the user actually typed; fall back to normalized tagword
+    const replaceTarget = (typedMatch && typedMatch[0]) ? typedMatch[0].replace(/^\s+/, "") : tagword;
+
+    // Build a small window around the token to also inspect following punctuation
+    let editStart = Math.max(cursorPos - replaceTarget.length, 0);
+    let editEnd = Math.min(cursorPos + replaceTarget.length, prompt.length);
     let surrounding = prompt.substring(editStart, editEnd);
-    let match = surrounding.match(new RegExp(escapeRegExp(`${tagword}`), "i"));
-    let afterInsertCursorPos = editStart + match.index + sanitizedText.length;
+
+    // Find index of the token within the surrounding text (case-insensitive)
+    let matchIndex = surrounding.toLowerCase().indexOf(replaceTarget.toLowerCase());
+    // If not found (e.g., space vs underscore mismatch), try the alternate form
+    if (matchIndex === -1) {
+        const altTarget = replaceTarget.includes("_") ? replaceTarget.replaceAll("_", " ") : replaceTarget.replaceAll(" ", "_");
+        matchIndex = surrounding.toLowerCase().indexOf(altTarget.toLowerCase());
+    }
+    // As a final fallback, assume the token starts at the beginning of our window
+    if (matchIndex === -1) matchIndex = 0;
+    // Cursor position after inserting the sanitized text
+    let afterInsertCursorPos = editStart + matchIndex + sanitizedText.length;
 
     var optionalSeparator = "";
     let extraNetworkTypes = [ResultType.hypernetwork, ResultType.lora];
     let noCommaTypes = [ResultType.wildcardFile, ResultType.yamlWildcard, ResultType.umiWildcard].concat(extraNetworkTypes);
     if (!noCommaTypes.includes(tagType)) {
         // Append comma if enabled and not already present
-        let beforeComma = surrounding.match(new RegExp(`${escapeRegExp(tagword)}[,:]`, "i")) !== null;
+        const afterPart = surrounding.substring(matchIndex + replaceTarget.length);
+        let beforeComma = afterPart.length > 0 && (afterPart[0] === "," || afterPart[0] === ":");
         if (TAC_CFG.appendComma)
             optionalSeparator = beforeComma ? "" : ",";
         // Add space if enabled
@@ -543,7 +563,7 @@ async function insertTextAtCursor(textArea, result, tagword, tabCompletedWithout
             optionalSeparator += " ";
         // If at end of prompt and enabled, override the normal setting if not already added
         if (!TAC_CFG.appendSpace && TAC_CFG.alwaysSpaceAtEnd)
-            optionalSeparator += surrounding.match(new RegExp(`${escapeRegExp(tagword)}$`, "im")) !== null ? " " : "";
+            optionalSeparator += (surrounding.length === (matchIndex + replaceTarget.length)) ? " " : "";
     } else if (extraNetworkTypes.includes(tagType)) {
         // Use the dedicated separator for extra networks if it's defined, otherwise fall back to space
         optionalSeparator = TAC_CFG.extraNetworksSeparator || " ";
@@ -553,8 +573,10 @@ async function insertTextAtCursor(textArea, result, tagword, tabCompletedWithout
     // We need four since we're also escaping them in replaceAll in the first place
     sanitizedText = sanitizedText.replaceAll("$", "$$$$");
 
-    // Replace partial tag word with new text, add comma if needed
-    let insert = surrounding.replace(match, sanitizedText + optionalSeparator);
+    // Replace partial tag word with new text, add comma/space if needed
+    let insert = surrounding.substring(0, matchIndex)
+        + sanitizedText + optionalSeparator
+        + surrounding.substring(matchIndex + replaceTarget.length);
 
     // Add back start
     var newPrompt = prompt.substring(0, editStart) + insert + prompt.substring(editEnd);
@@ -1145,6 +1167,30 @@ async function autocomplete(textArea, prompt, fixedTag = null) {
     }
 
     if (fixedTag === null) {
+        // === caret 直近トークンのフォールバック ===
+        // ComfyUI の挙動に寄せて、カーソル直前から「, ; \" | { } ( ) 改行」以外を単語として拾う
+        const caret = textArea.selectionEnd;
+        const left = prompt.slice(0, caret);
+        // Suppress autocomplete when entering comments, curly braces, or after a pipe
+        // If current line contains a '#' before caret, treat as comment; also suppress immediately after '{', '}', or '|'
+        const prevChar = left.slice(-1);
+        const lineStart = left.lastIndexOf('\n') + 1;
+        const inComment = left.indexOf('#', lineStart) !== -1;
+        if (inComment || prevChar === '{' || prevChar === '}' || prevChar === '|') {
+            hideResults(textArea);
+            previousTags = [];
+            tagword = "";
+            return;
+        }
+        const m = left.match(/([^,;"|{}()\n]+)$/);
+        if (m && m[0]) {
+            tagword = m[0].replace(/^\s+/, "").replace(/\s/g, "_").toLowerCase();
+            // ここで通常の検索フローを使うため、後段の result 検索に進む
+        } else {
+            tagword = null;
+        }
+        // 既存の「差分で拾う」ロジックに入る必要があるのは tagword が拾えなかった場合のみ
+        if (tagword === null) {
         // Match tags with RegEx to get the last edited one
         // We also match for the weighting format (e.g. "tag:1.0") here, and combine the two to get the full tag word set
         let weightedTags = [...prompt.matchAll(WEIGHT_REGEX)]
@@ -1192,15 +1238,15 @@ async function autocomplete(textArea, prompt, fixedTag = null) {
         }
 
         tagword = diff[0]
-
-        // Guard for empty tagword
-        if (tagword === null || tagword.length === 0) {
-            hideResults(textArea);
-            return;
         }
-    } else {
-        tagword = fixedTag;
-    }
+         // Guard for empty tagword
+         if (tagword === null || tagword.length === 0) {
+             hideResults(textArea);
+             return;
+         }
+     } else {
+         tagword = fixedTag;
+     }
 
     results = [];
     resultCountBeforeNormalTags = 0;
@@ -1512,7 +1558,10 @@ function addAutocompleteToArea(area) {
             updateRuby(area, area.value);
 
             // Cancel autocomplete itself if the event has no inputType (e.g. because it was triggered by the updateInput() function)
-            if (!e.inputType && !tacSelfTrigger) return;
+            if (!e.inputType && !tacSelfTrigger) {
+                try { lastInputValues.set(area, area.value); } catch {}
+                return;
+            }
             tacSelfTrigger = false;
 
             // Block hide we are composing (IME), so enter doesn't close the results
@@ -1521,14 +1570,60 @@ function addAutocompleteToArea(area) {
                 setTimeout(() => { hideBlocked = false; }, 100);
             }
 
+            // Hide suggestions when a newline is inserted (Enter)
+            if (e.inputType === 'insertLineBreak') {
+                if (!hideBlocked) hideResults(area);
+                try { lastInputValues.set(area, area.value); } catch {}
+                return;
+            }
+
+            // Suppress suggestions when only {}, #, or | were deleted via Backspace/Delete
+            try {
+                const prevVal = lastInputValues.get(area);
+                if (prevVal !== undefined &&
+                    (e.inputType === 'deleteContentBackward' || e.inputType === 'deleteContentForward')) {
+                    const curVal = area.value;
+                    const diff = prevVal.length - curVal.length;
+                    if (diff === 1) {
+                        const caret = area.selectionEnd;
+                        // For backward delete, removed char is just before caret in previous value
+                        // For forward delete, removed char is at caret in previous value
+                        const removedIndex = (e.inputType === 'deleteContentBackward')
+                            ? caret
+                            : caret;
+                        const removedChar = prevVal.charAt(removedIndex);
+                        if (removedChar === '{' || removedChar === '}' || removedChar === '#' || removedChar === '|') {
+                            hideResults(area);
+                            previousTags = [];
+                            tagword = "";
+                            try { lastInputValues.set(area, curVal); } catch {}
+                            return;
+                        }
+                    }
+                }
+            } catch { }
+
             debounce(autocomplete(area, area.value), TAC_CFG.delayTime);
             checkKeywordInsertionUndo(area, e);
+            try { lastInputValues.set(area, area.value); } catch {}
         });
         // Add focusout event listener
         area.addEventListener('focusout', debounce(() => {
             if (!hideBlocked)
                 hideResults(area);
         }, 400));
+        // === 外側クリックで閉じる（ComfyUI寄せ） ===
+        if (!area.dataset.tacOutsideClose) {
+            document.addEventListener('pointerdown', (e) => {
+                const parent = gradioApp().querySelector('.autocompleteParent' + getTextAreaIdentifier(area));
+                if (!parent) return;
+                // popup外 かつ textareaでもない なら閉じる
+                if (!parent.contains(e.target)) {
+                    if (!hideBlocked) hideResults(area);
+                }
+            }, true); // captureで先取りすると安定
+            area.dataset.tacOutsideClose = '1';
+        }		
         // Add up and down arrow event listener
         area.addEventListener('keydown', (e) => navigateInList(area, e));
         // CompositionEnd fires after the user has finished IME composing
@@ -1540,6 +1635,8 @@ function addAutocompleteToArea(area) {
 
         // Add class so we know we've already added the listeners
         area.classList.add('autocomplete');
+        // Initialize last value tracking for this area
+        try { lastInputValues.set(area, area.value); } catch {}
     }
 }
 
